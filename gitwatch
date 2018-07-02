@@ -1,0 +1,369 @@
+#!/usr/bin/env ruby
+
+# Reference:
+# https://developer.atlassian.com/static/rest/bitbucket-server/5.2.0/bitbucket-rest.html
+
+require 'base64'
+require 'io/console'
+require 'json'
+
+API_VERSION = '1.0'
+API_PATH    = '/rest/api/' + API_VERSION
+# GITPUB_API_BASE_URL = 'https://gitpub.DOMAIN.com/rest/api/' + API_VERSION
+# DOMAIN_API_BASE_URL = 'https://git.DOMAIN.com/rest/api/' + API_VERSION
+
+# TODO: does this always work?
+GIT_REMOTE_URL_FORMAT = /^.*?@(.+?)(?::|\/).+\/(.+)\/(.+)\.git$/
+GITPUB_REMOTE_URL_FORMAT = /^.*?\/\/(.+)\/scm\/(.+)\/(.+)\.git$/
+
+REFRESH_RATE        = 10 * 60 # 10 minutes
+TOO_OLD_THRESHOLD   = Time.now - 60 * 60 * 24 * 30 # 30 days ago
+
+COMMENT_INDENT      = 2
+COMMENT_INDENT_DEFAULT  = COMMENT_INDENT * 2
+COMMENT_INDENT_MAX      = 20
+COMMENT_LINE_LENGTH     = 80
+
+class GitWatch
+  def initialize
+    @config = {}
+    @pr_info = {}
+
+    init_repo_path
+    init_headers
+  rescue => e
+    puts e
+    exit
+  end
+
+  def watch
+    fetch_initial_prs
+
+    while sleep REFRESH_RATE do
+      check_prs
+      puts "\nUpdated at #{Time.now.strftime('%H:%M:%S')}"
+    end
+  end
+
+  private
+
+  def init_repo_path
+    remote_origin_url = `git config --get remote.origin.url`
+    repo_info = remote_origin_url.match(GIT_REMOTE_URL_FORMAT)
+    repo_info ||= remote_origin_url.match(GITPUB_REMOTE_URL_FORMAT)
+
+    if repo_info.nil? || repo_info.captures.empty?
+      raise 'Not a git repo'
+    end
+
+    domain, project, repo = repo_info.captures
+    puts "Start watching #{project}/#{repo}"
+    system "printf \"\033]0;gitwatch: #{project}/#{repo}\007\""
+
+    @config[:url] = 'https://' + domain
+    @config[:path] = "/projects/#{project}/repos/#{repo}"
+  end
+
+  def init_headers
+    @config[:user_name] = `git config --get user.name`.chomp
+    print "Password for #{@config[:user_name].pink}: "
+    password = STDIN.noecho(&:gets).chomp
+    puts ''
+    auth = Base64.encode64("#{@config[:user_name]}:#{password}").chomp
+
+    @config[:headers] = [
+      '-H "Content-Type: application/json"',
+      "-H \"Authorization: Basic #{auth}\"",
+    ]
+  end
+
+  def request(resource, options = {})
+    url = "#{@config[:url] + API_PATH + @config[:path]}/#{resource}" +
+      (options[:sub_path] || '') +
+      (parse_url_params(options[:params]) || '')
+
+    curl_command = [
+      'curl -X GET',
+      @config[:headers].join(' '),
+      "\"#{url}\"",
+      '2> /dev/null'
+    ].join(' ')
+
+    response = `#{curl_command}`
+    JSON.parse(response)
+  rescue => e
+    puts 'An error occurred while parsing the response'
+    puts e
+    puts response if defined? response
+    {}
+  end
+
+  def parse_url_params(params)
+    return if params.nil?
+
+    return '?' + params.map { |k, v| k + '=' + v.to_s } .join('&')
+  end
+
+  def fetch_initial_prs
+    prs = fetch_prs
+
+    puts "\n# Open Pull Requests:"
+    prs.each do |pr|
+      make_pr_info(pr, with_approval: true)
+
+      puts " * #{format_pr(pr, with_author: true, with_target: true, with_status: true)}"
+
+      last_updated_date = Time.at(@pr_info[pr['id']][:last_updated] / 1000)
+      if last_updated_date < TOO_OLD_THRESHOLD
+        puts "   (##{pr['id']} is too old and will be skipped)"
+      end
+    end
+    puts ''
+  end
+
+  def check_prs
+    prs = fetch_prs
+
+    prs.each do |pr|
+      if @pr_info.keys.include? pr['id']
+        check_pr_activity(pr['id'])
+      else
+        puts "\n#{get_user_name(pr['author'])} opened #{format_pr(pr, with_target: true)}"
+        make_pr_info(pr)
+      end
+    end
+
+    (@pr_info.keys - (prs.map { |pr| pr['id'] } )).each do |pr_id|
+      check_pr_activity(pr_id)
+    end
+  end
+
+  def check_pr_activity(pr_id)
+    activities = fetch_pr_activity(pr_id)
+
+    output = [
+      "\nActivity for #{format_pr(@pr_info[pr_id][:pr_object], with_target: true, with_status: true)}" +
+      "\n#{@config[:url] + @config[:path]}/pull-requests/#{pr_id}/overview".lblue
+    ]
+
+    merged = false
+    activities.reverse.each do |activity|
+      thread = extract_comment_thread(activity)
+
+      if @pr_info[pr_id][:activities].has_key? activity['id']
+
+        thread[:ids] -= @pr_info[pr_id][:activities][activity['id']][:comment_ids]
+
+        next if thread[:ids].empty?
+
+        @pr_info[pr_id][:activities][activity['id']][:comment_ids] += thread[:ids]
+
+        activity['action'] = 'REPLIED'
+      else
+        @pr_info[pr_id][:activities][activity['id']] = { comment_ids: thread[:ids] }
+      end
+
+      user_name = get_user_name(activity)
+
+      case activity['action']
+      when 'COMMENTED'
+        output << " * #{user_name} made a comment:"
+
+        print_comment(output, activity['comment']['text'])
+
+        print_reply_comments(output, thread)
+
+      when 'REPLIED'
+        output << " * Original comment by #{user_name}:"
+        print_comment(output, thread[:original_text].slice(0, COMMENT_LINE_LENGTH - COMMENT_INDENT_DEFAULT - 3) + '...')
+
+        print_reply_comments(output, thread)
+
+      when 'APPROVED'
+        output << " * #{'Approved'.green} by #{user_name}"
+
+      when 'UNAPPROVED'
+        output << " * #{'Unapproved'.red} by #{user_name}"
+
+      when 'REVIEWED'
+        output << " * #{user_name} marked the ぷるるん as '#{'needs work'.red}'"
+
+      when 'MERGED'
+        output << " * #{'Merged'.green} by #{user_name}"
+        merged = true
+
+      when 'RESCOPED'
+        output << " * #{user_name} updated the ぷるるん"
+
+      else
+        output << " * #{user_name}: #{activity['action'].blue} ?"
+        output << "DEBUG: #{activity.inspect}"
+      end
+    end
+
+    puts output.join("\n") unless output.length == 1
+    @pr_info.delete(pr_id) if merged
+  end
+
+  def make_pr_info(pr, options = { with_approval: false })
+    @pr_info[pr['id']] = {
+      pr_object: pr,
+      last_updated: pr['updatedDate'],
+      is_approved: options[:with_approval] ? is_approved?(pr) : false,
+      activities: {},
+    }
+
+    fetch_pr_activity(pr['id']).each do |activity|
+      thread = extract_comment_thread(activity)
+      @pr_info[pr['id']][:activities][activity['id']] = { comment_ids: thread[:ids] }
+    end
+  end
+
+  # TODO: start_offset isn't used, but 25 is already too much! lol
+  def fetch_pr_activity(pr_id, start_offset = nil)
+    last_updated_date = Time.at(@pr_info[pr_id][:last_updated] / 1000)
+    return [] if last_updated_date < TOO_OLD_THRESHOLD
+
+    response = request(
+      'pull-requests',
+      sub_path: "/#{pr_id}/activities",
+      params: ({
+        'start' => start_offset,
+      } if start_offset),
+    )
+
+    response['values'] || []
+  end
+
+  def fetch_prs
+    prs = []
+    next_page_start = nil
+
+    loop do
+      response = request(
+        'pull-requests',
+        params: ({
+          'start' => next_page_start.to_s,
+        } if next_page_start),
+      )
+
+      return prs if response.empty? || response['values'].nil?
+
+      prs += response['values']
+
+      return prs if response['isLastPage']
+
+      next_page_start = response['nextPageStart']
+    end
+  end
+
+  def get_user_name(item, options = {})
+    options = { colour: true, exact: false }.merge options
+    item = item['author'] if item['author']
+    user_name = item['slug'] || item['user']['slug']
+    user_name = 'You' if user_name == @config[:user_name] && !options[:exact]
+    options[:colour] ? user_name.pink : user_name
+  rescue
+    'Unknown User'
+  end
+
+  def format_pr(pr, options = {})
+    target = status = nil
+
+    if options[:with_target]
+      target = " → \"#{pr['toRef']['id'].split('/').drop(2).join('/')}\""
+    end
+
+    if options[:with_status]
+      status = @pr_info[pr['id']][:is_approved] ? " (#{'approved'.green})" : nil
+      status ||= is_needs_work?(pr) ? " (#{'needs work'.red})" : ''
+    end
+
+    "#{('#' + pr['id'].to_s).lblue} \"#{pr['title'].yellow}\"" +
+      (target || '') +
+      (options[:with_author] ? " (#{get_user_name(pr)})" : '') +
+      (status || '')
+  end
+
+  def is_approved?(pr)
+    get_status(pr) == 'APPROVED'
+  end
+
+  def is_needs_work?(pr)
+    get_status(pr) == 'NEEDS_WORK'
+  end
+
+  def get_status(pr)
+    viewers = pr['reviewers'] + pr['participants']
+    user = viewers.find { |viewer| get_user_name(viewer, colour: false, exact: true) == @config[:user_name] }
+    return if user.nil?
+    user['status']
+  end
+
+  def extract_comment_thread(activity)
+    return { original_text: '', ids: [], replies: [] } if activity['action'] != 'COMMENTED'
+
+    comment_ids = []
+    comment_tree = extract_replies(activity['comment'], comment_ids)
+
+    {
+      original_text: activity['comment']['text'],
+      ids: comment_ids,
+      replies: comment_tree
+    }
+  end
+
+  def extract_replies(comment, comment_ids)
+    return [] if comment['comments'].empty?
+
+    comment['comments'].each.with_object([]) do |reply, replies|
+      comment_ids << reply['id']
+      user = get_user_name(reply)
+
+      replies << {
+        id: reply['id'],
+        user: user,
+        text: reply['text'],
+        replies: extract_replies(reply, comment_ids),
+      }
+    end
+  end
+
+  def print_comment(output, comment, indent = COMMENT_INDENT_DEFAULT)
+    indent = [indent, COMMENT_INDENT_MAX].min
+
+    comment.split("\n").each do |line|
+      line.chars.each_slice(COMMENT_LINE_LENGTH - indent) do |wrapped_line|
+        output << ((' ' * indent) + wrapped_line.join).yellow
+      end
+    end
+  end
+
+  def print_reply_comments(output, thread, ids = nil, indent = 1)
+    thread[:replies].each do |reply|
+      # TODO new ids?
+#      next if new_ids.include?(reply[:id])
+
+      output << (' ' * indent * COMMENT_INDENT) + " > #{reply[:user].pink} replied"
+      print_comment(output, reply[:text], COMMENT_INDENT_DEFAULT + indent * COMMENT_INDENT)
+      print_reply_comments(output, reply, ids || thread[:ids], indent + 1)
+    end
+  end
+end
+
+class String
+  [
+    [ 'red',    31 ],
+    [ 'green',  32 ],
+    [ 'yellow', 33 ],
+    [ 'blue',   34 ],
+    [ 'pink',   35 ],
+    [ 'lblue',  36 ],
+  ].each do |colour, code|
+    define_method(colour) do
+      "\e[#{code}m#{self}\e[0m"
+    end
+  end
+end
+
+GitWatch.new.watch

@@ -146,7 +146,7 @@ class GitWatch
       "\n#{@config[:url] + @config[:path]}/pull-requests/#{pr_id}/overview".lblue
     ]
 
-    merged = false
+    stop_following = false
     activities.reverse.each do |activity|
       thread = extract_comment_thread(activity)
 
@@ -190,10 +190,14 @@ class GitWatch
 
       when 'MERGED'
         output << " * #{'Merged'.green} by #{user_name}"
-        merged = true
+        stop_following = true
 
       when 'RESCOPED'
-        output << " * #{user_name} updated the ぷるるん"
+        output << " * #{'Updated'.yellow} by #{user_name}"
+
+      when 'DECLINED'
+        output << " * #{'Declined'.red} by #{user_name}"
+        stop_following = true
 
       else
         output << " * #{user_name}: #{activity['action'].blue} ?"
@@ -202,7 +206,7 @@ class GitWatch
     end
 
     puts output.join("\n") unless output.length == 1
-    @pr_info.delete(pr_id) if merged
+    @pr_info.delete(pr_id) if stop_following
   end
 
   def make_pr_info(pr, options = { with_approval: false })

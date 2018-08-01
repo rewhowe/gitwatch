@@ -199,6 +199,9 @@ class GitWatch
         output << " * #{'Declined'.red} by #{user_name}"
         stop_following = true
 
+      # when 'UPDATED'
+      # TODO: "addedReviewers"=>[], "removedReviewers"=>[{"name"=>"first.last",
+
       else
         output << " * #{user_name}: #{activity['action'].blue} ?"
         output << "DEBUG: #{activity.inspect}"

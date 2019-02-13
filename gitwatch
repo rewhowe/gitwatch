@@ -24,8 +24,11 @@ COMMENT_INDENT_DEFAULT  = COMMENT_INDENT * 2
 COMMENT_INDENT_MAX      = 20
 COMMENT_LINE_LENGTH     = 80
 
+# TODO: make generic print function that wraps at 80 chars and preserves indent
+# TODO: make proper classes to hold PRs, PR Activities, Comments, etc...
 class GitWatch
   def initialize
+    puts '-'*32 + ' 80 chars width ' + '-'*32
     @config = {}
     @pr_info = {}
 
@@ -66,15 +69,24 @@ class GitWatch
 
   def init_headers
     @config[:user_name] = `git config --get user.name`.chomp
-    print "Password for #{@config[:user_name].pink}: "
-    password = STDIN.noecho(&:gets).chomp
-    puts ''
-    auth = Base64.encode64("#{@config[:user_name]}:#{password}").chomp
-
     @config[:headers] = [
       '-H "Content-Type: application/json"',
-      "-H \"Authorization: Basic #{auth}\"",
     ]
+
+    print "Access Token for #{@config[:user_name].pink}" +
+      ' (empty for basic auth): '
+    token = STDIN.noecho(&:gets).chomp
+
+    if !token.empty?
+      @config[:headers] << "-H \"Authorization: Bearer #{token}\""
+    else
+      print "Password for #{@config[:user_name].pink}: "
+      password = STDIN.noecho(&:gets).chomp
+      auth = Base64.encode64("#{@config[:user_name]}:#{password}").chomp
+      @config[:headers] << "-H \"Authorization: Basic #{auth}\""
+    end
+
+    puts ''
   end
 
   def request(resource, options = {})
@@ -198,6 +210,9 @@ class GitWatch
       when 'DECLINED'
         output << " * #{'Declined'.red} by #{user_name}"
         stop_following = true
+
+      when 'OPENED'
+        output << " * #{'Opened'.green} by #{user_name}"
 
       else
         output << " * #{user_name}: #{activity['action'].blue} ?"
